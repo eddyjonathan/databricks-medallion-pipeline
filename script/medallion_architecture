@@ -105,7 +105,7 @@ SELECT * FROM med_silver_orders ORDER BY order_id;
 Add a new snippet
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 %sql
---Build Gold layer objects: a stored aggregate table, a view, and data quality checks on the Silver output. The 2026 syllabus adds explicit data quality validation.
+--Build Gold layer objects: a stored aggregate table, a view, and data quality checks on the Silver output. 
 
 CREATE OR REPLACE TABLE med_gold_revenue AS
 SELECT 
