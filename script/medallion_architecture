@@ -1,0 +1,150 @@
+Simple project : Use one notebook. 
+
+
+
+#Bronze - raw ingestion with auto loader
+#goal - ingest raw data , no transformation
+#data is created directly in databricks
+
+import json
+
+# Using Unity Catalog Volume instead of DBFS (DBFS root is disabled)
+source = "/Volumes/myfile/med_demo/files/source/"
+ckpt_b = "/Volumes/myfile/med_demo/files/ckpt_bronze/"
+dbutils.fs.mkdirs(source)
+
+raw = [
+    {"order_id": "O001", "customer": "Alice",  "product": "Laptop", "amount": "1200",    "date": "2024-01-10"},
+    {"order_id": "O002", "customer": "Bob",    "product": "Phone",  "amount": "BAD_DATA","date": "2024-01-11"},
+    {"order_id": None,    "customer": "Carol",  "product": "Tablet", "amount": "600",     "date": "2024-01-12"},
+    {"order_id": "O003", "customer": "Alice",  "product": "Laptop", "amount": "1200",    "date": "2024-01-13"},
+]
+dbutils.fs.put(source + "orders_b1.json", "\n".join(json.dumps(r) for r in raw), overwrite=True)
+print("Source files ready")
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Add a new snippet
+
+(
+    spark.readStream.format("cloudFiles")
+        .option("cloudFiles.format", "json")
+        .option("cloudFiles.schemaLocation", ckpt_b + "schema")
+        .option("cloudFiles.inferColumnTypes", "false")  # keep everything as strings
+        .load(source)
+    .writeStream.format("delta")
+        .option("checkpointLocation", ckpt_b + "data")
+        .trigger(availableNow=True)
+        .toTable("med_bronze_orders")
+    .awaitTermination()
+)
+spark.sql("SELECT * FROM med_bronze_orders").show()
+# All 4 rows including the bad one — Bronze preserves everything
+
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Add a new snippet
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#Transform Bronze to Silver: cast types, filter bad records, deduplicate, and use MERGE INTO for incremental updates instead of overwriting the whole table.
+
+from pyspark.sql import functions as F
+
+bronze=spark.table("med_bronze_orders")
+
+silver =(
+    bronze
+    .withColumn("amount", F.expr("try_cast(amount as double)"))
+    .withColumn("order_date", F.to_date(F.col("date"), "yyyy-MM-dd"))
+    .drop("date")
+    .filter(F.col("order_id").isNotNull())
+    .filter(F.col("amount").isNotNull())
+    .filter(F.col("amount") > 0)
+    .dropDuplicates(["order_id"])
+    .withColumn("silver_ts", F.current_timestamp())
+)
+
+silver.write.format("delta").mode("overwrite").saveAsTable("med_silver_orders")
+
+print(f"Bronze : {bronze.count()} rows → Silver: {silver.count()} rows ")
+
+spark.sql("SELECT * FROM med_silver_orders").show()
+
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Add a new snippet
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+%sql
+-- New batch arrives: O002 is corrected, O004 is new
+
+CREATE OR REPLACE TABLE new_batch AS
+SELECT * FROM (
+    VALUES
+    ('O002', 'Bob',  'Phone',  850.0, DATE('2024-01-11')),
+    ('O004', 'Dave', 'Mouse',   45.0, DATE('2024-01-14'))
+)t(order_id, customer, product, amount, order_date);
+
+MERGE INTO med_silver_orders AS t
+USING new_batch AS s
+ON t.order_id = s.order_id
+WHEN MATCHED THEN UPDATE SET
+    t.amount = s.amount,
+    t.customer = s.customer
+WHEN NOT MATCHED THEN INSERT (order_id, customer, product, amount, order_date, _rescued_data, silver_ts)
+    VALUES (s.order_id, s.customer, s.product, s.amount, s.order_date, NULL, current_timestamp());
+
+SELECT * FROM med_silver_orders ORDER BY order_id;
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Add a new snippet
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+%sql
+--Build Gold layer objects: a stored aggregate table, a view, and data quality checks on the Silver output. The 2026 syllabus adds explicit data quality validation.
+
+CREATE OR REPLACE TABLE med_gold_revenue AS
+SELECT 
+    product,
+    COUNT(*)    AS total_orders,
+    SUM(amount) AS total_revenue,
+    ROUND(AVG(amount),2)   AS avg_order,
+    MIN(order_date) AS first_order,
+    MAX(order_date) AS last_order
+FROM med_silver_orders
+GROUP BY product
+ORDER BY total_revenue DESC;
+
+SELECT * FROM med_gold_revenue;
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Add a new snippet
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Data quality checks: assert expected properties of the Silver table
+# In a real pipeline these would fail the job if violated
+
+quality_checks = spark.sql("""
+SELECT 
+COUNT(*)                    AS total_rows,
+SUM(CASE WHEN order_id IS NULL THEN 1 ELSE 0 END) AS null_order_ids,
+SUM(CASE WHEN amount <=0 THEN 1 ELSE 0 END) AS negative_amounts,
+SUM(CASE WHEN amount > 10000 THEN 1 ELSE 0 END) AS suspisciously_large,
+COUNT(DISTINCT order_id) = COUNT(*)     AS no_duplicates
+FROM med_silver_orders 
+""")
+quality_checks.show(truncate=False)
+
+import sys
+check = quality_checks.collect()[0]
+
+if check["null_order_ids"] > 0 or check["negative_amounts"] > 0:
+    raise AssertionError("Data quality check failed!")
+print("All data quality checks passed ✓")
+
+
